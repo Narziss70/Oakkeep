@@ -42,6 +42,18 @@ It does **not** send mail, change Thunderbird settings, or upload anything.
 sudo apt install python3 python3-gi gir1.2-gtk-3.0 gir1.2-notify-0.7
 ```
 
+On Fedora, install the equivalent packages with:
+
+```bash
+sudo dnf install python3 python3-gobject gtk3
+```
+
+On Arch Linux:
+
+```bash
+sudo pacman -S python gtk3 python-gobject
+```
+
 No pip packages are required.
 
 ## Install
