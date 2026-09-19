@@ -1,0 +1,5 @@
+#!/bin/sh
+# Double-click this, or: right-click oakkeep.py → Open With → Python 3
+DIR=$(dirname "$(readlink -f "$0")")
+cd "$DIR" || exit 1
+exec python3 "$DIR/oakkeep.py"

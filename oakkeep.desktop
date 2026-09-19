@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Oakkeep
+Comment=Local email archive
+Exec=/usr/bin/python3 oakkeep.py
+Path=
+Icon=oakkeep
+Terminal=false
+Categories=Office;Email;
+StartupNotify=true
+StartupWMClass=Oakkeep
