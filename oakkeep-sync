@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Copy ticked Thunderbird folders into the Oakkeep archive. No GTK window.
+
+Reads ~/.config/oakkeep/config.json. Safe for cron.
+"""
+
+from __future__ import annotations
+
+import sys
+import traceback
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from oakkeep_app.store import Archive, load_config, load_pairs  # noqa: E402
+
+
+def main() -> int:
+    cfg = load_config()
+    archive_path = (cfg.get("archive") or "").strip()
+    if not archive_path:
+        print("No archive path in ~/.config/oakkeep/config.json. Open Oakkeep and use Open archive once.", file=sys.stderr)
+        return 1
+    root = Path(archive_path)
+    if not root.is_dir():
+        print(f"Archive folder missing: {root}", file=sys.stderr)
+        return 1
+    pairs = load_pairs()
+    if not pairs:
+        print("No Thunderbird pairs saved. Add them in Oakkeep Settings.", file=sys.stderr)
+        return 1
+
+    archive = Archive(root)
+    imported = skipped = 0
+    problems = 0
+    try:
+        if not archive.integrity_ok():
+            print("Index is damaged. Rebuild it in Oakkeep before syncing.", file=sys.stderr)
+            return 1
+        print(f"Archive: {archive.root}")
+        seen, added = archive.catch_up()
+        print(f"Index catch-up: {seen} files seen, {added} newly indexed.")
+        for pair in pairs:
+            account = (pair.get("account") or "").strip()
+            tb = Path(pair.get("thunderbird") or "")
+            folders = pair.get("folders")
+            if not account:
+                print("Skipped a pair with no archive folder name.")
+                problems += 1
+                continue
+            if not isinstance(folders, dict):
+                print(f"{account}: no folder selection saved — skipped. Tick folders in Settings.")
+                problems += 1
+                continue
+            if not tb.is_dir():
+                print(f"{account}: Thunderbird folder missing — {tb}")
+                problems += 1
+                continue
+            print(f"{account}: copying ticked folders from {tb}")
+            n, s = archive.copy_thunderbird(tb, account, folder_enabled=folders)
+            imported += n
+            skipped += s
+            print(f"{account}: copied {n}, skipped {s} already archived.")
+        print(f"Done. Copied {imported} new messages, skipped {skipped}.")
+        return 1 if problems and imported == 0 and skipped == 0 else 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+    finally:
+        archive.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

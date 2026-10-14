@@ -57,10 +57,13 @@ def list_account_folders(tb: Path) -> list[dict]:
 
 
 def folder_is_enabled(folder_enabled: dict | None, key: str) -> bool:
-    """Missing key = selected. Empty/None map = every folder selected."""
-    if not folder_enabled:
-        return True
-    return bool(folder_enabled.get(key, True))
+    """A saved map copies only keys set true. Missing key = not selected.
+
+    None / non-dict means the user has not chosen folders yet: copy nothing.
+    """
+    if not isinstance(folder_enabled, dict):
+        return False
+    return bool(folder_enabled.get(key, False))
 
 
 def is_parent_display(display: str, all_displays: list[str]) -> bool:
@@ -80,7 +83,7 @@ def merge_folder_map(saved: dict | None, listed_keys: list[str], live: dict[str,
     saved_d = saved if isinstance(saved, dict) else {}
     listed = set(listed_keys)
     for key in listed_keys:
-        out[key] = bool(live.get(key, saved_d.get(key, True)))
+        out[key] = bool(live.get(key, saved_d.get(key, False)))
     # Keep explicit False for folders that disappeared so they stay off if they return
     for key, value in saved_d.items():
         if key not in listed and not value:
@@ -89,16 +92,15 @@ def merge_folder_map(saved: dict | None, listed_keys: list[str], live: dict[str,
 
 
 def folder_summary(folders: dict | None, rows: list[dict] | None = None) -> str:
+    if not isinstance(folders, dict):
+        return "Not chosen"
     if rows:
         leaves = leaf_rows(rows)
         keys = [r["key"] for r in leaves]
-        enabled = folders or {}
+        enabled = folders
         total = len(keys)
-        selected = sum(1 for key in keys if enabled.get(key, True))
+        selected = sum(1 for key in keys if enabled.get(key, False))
     else:
-        if not folders:
-            return "All folders"
-        # Ignore keys that look like parents of another saved key
         displays = list(folders.keys())
         keys = [k for k in folders if not is_parent_display(k, displays) and not any(
             other.startswith(str(k).rstrip("/") + "/") for other in folders if other != k
@@ -108,7 +110,7 @@ def folder_summary(folders: dict | None, rows: list[dict] | None = None) -> str:
         total = len(keys)
         selected = sum(1 for key in keys if folders.get(key))
     if total == 0:
-        return "All folders"
+        return "No folders"
     if selected == total:
         return "All folders"
     if selected == 0:
@@ -117,7 +119,8 @@ def folder_summary(folders: dict | None, rows: list[dict] | None = None) -> str:
 
 
 def filter_mailboxes(tb: Path, mailboxes: list[Path], folder_enabled: dict | None) -> list[Path]:
-    if not folder_enabled:
-        return mailboxes
+    """Copy only folders the user ticked. A missing key is off, not on."""
+    if not isinstance(folder_enabled, dict):
+        return []
     root = Path(tb)
     return [p for p in mailboxes if folder_is_enabled(folder_enabled, mailbox_key(root, p))]

@@ -7,6 +7,7 @@ import re
 from email import policy
 from email.header import decode_header, make_header
 from email.parser import BytesParser
+from datetime import timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -74,11 +75,38 @@ def archive_key(message_id: str, from_addr: str, date: str, subject: str) -> str
     return f"fp:{(from_addr or '').lower()}|{minute}|{(subject or '').strip().lower()}"
 
 
-def iso_date(date: str) -> str:
+def parsed_date(date: str):
+    if not date:
+        return None
     try:
-        return parsedate_to_datetime(date).strftime("%Y-%m-%dT%H:%M:%S")
+        return parsedate_to_datetime(date)
     except Exception:
-        return date or ""
+        return None
+
+
+def utc_sort(date: str) -> str:
+    """Absolute instant for sorting. Naive headers are left as written."""
+    dt = parsed_date(date)
+    if dt is None:
+        return (date or "")[:19]
+    if dt.tzinfo is None:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def local_when(date: str, fallback: str = "") -> str:
+    """Wall time in the computer's current timezone, matching a mailbox UI."""
+    dt = parsed_date(date)
+    if dt is None:
+        raw = (fallback or date or "").replace("T", " ").replace("Z", "")
+        return raw[:16]
+    if dt.tzinfo is None:
+        return dt.strftime("%Y-%m-%d %H:%M")
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def iso_date(date: str) -> str:
+    return utc_sort(date)
 
 
 def iso_day(date: str) -> str:
@@ -86,6 +114,53 @@ def iso_day(date: str) -> str:
         return parsedate_to_datetime(date).strftime("%Y-%m-%d")
     except Exception:
         return "unknown-date"
+
+
+def best_date(msg) -> str:
+    """Prefer Date: header; fall back to the date in the first Received: header."""
+    date = decode_words(msg.get("date"))
+    if date and parsed_date(date):
+        return date
+    for rec in msg.get_all("received", []) or []:
+        rec = decode_words(str(rec))
+        m = re.search(r";\s*(.+)$", rec)
+        if m:
+            cand = m.group(1).strip()
+            if parsed_date(cand):
+                return cand
+    return date or ""
+
+
+def mailbox_incomplete(path: Path) -> bool:
+    """Practical heuristic: local mbox looks incomplete relative to its .msf index.
+
+    Flags a folder when a non-trivial .msf exists but the mbox yields no messages,
+    or the index is disproportionately large compared with the extracted content.
+    """
+    msf = path.with_name(path.name + ".msf")
+    if not msf.is_file():
+        return False
+    try:
+        msf_size = msf.stat().st_size
+        mbox_size = path.stat().st_size
+    except OSError:
+        return False
+    if msf_size < 2048:
+        return False
+    try:
+        count = 0
+        for _ in iter_mailbox(path):
+            count += 1
+            if count > 2000:
+                break
+    except Exception:
+        return False
+    if count == 0 and msf_size > 4096:
+        return True
+    # .msf is typically a few hundred bytes per message summary
+    if count > 0 and msf_size > count * 1500 and mbox_size < max(count * 200, 1024):
+        return True
+    return False
 
 
 def safe_filename(s: str) -> str:
@@ -170,7 +245,7 @@ def summarize(data: bytes, rel_path: str, size: int) -> dict:
     subject = decode_words(msg.get("subject")) or "(no subject)"
     from_raw = addresses(msg, "from")
     to_raw = addresses(msg, "to")
-    date = decode_words(msg.get("date"))
+    date = best_date(msg)
     mid = decode_words(msg.get("message-id"))
     atts = attachment_names(msg)
     from_addr = first_addr(from_raw)

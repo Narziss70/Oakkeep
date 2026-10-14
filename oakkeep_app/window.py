@@ -14,10 +14,52 @@ from gi.repository import Gdk, GLib, Gtk, Pango
 
 from .folders import folder_summary, leaf_rows, list_account_folders, merge_folder_map
 from .icons import apply_window_icon, install_launcher, set_program_identity
-from .mail import body_text, parse_message
+from .mail import best_date, body_text, local_when, parse_message
 from .store import Archive, load_config, load_pairs, save_config, save_pairs
+from . import __version__
 
 set_program_identity()
+
+
+def help_text(script: Path) -> str:
+    cmd = str(script)
+    return f"""Oakkeep copies new Thunderbird mail into a folder of .eml files and searches that archive. The files are the archive. The SQLite file next to them (.oakkeep-index.sqlite) is only an index and can be rebuilt.
+
+Open archive
+  Point at the folder that already holds your account folders (for example the parent of me@example.com).
+
+Settings
+  Pair each Thunderbird account folder (the one that contains INBOX) with an archive subfolder name.
+  Tick the mailboxes to copy. A new pair starts with every folder ticked. Folders that appear later are listed but left unticked until you select them. Unticked folders, including Trash, Drafts, and Spam, are not copied and no archive folder is created for them.
+
+Copy from Thunderbird
+  Copies only ticked folders. A message already in the archive (same Message-ID, or the same from/date/subject key) is skipped. Stop cancels the job.
+
+Times
+  The list shows the Date header converted to this computer's timezone, the same instant Gmail shows when the account timezone matches the laptop. The first time an archive is opened after this update, the index sort field is rewritten. The .eml files are not modified. Rebuild is not required.
+
+Search
+  Type in the box and press Enter. The left list is archive folders. Right-click an empty folder (no .eml files in it or under it) to move it to the desktop Trash. Folders that still contain mail have no delete menu.
+
+Duplicates
+  Finds extra copies of the same message so you can trash or delete them.
+
+Command line (cron)
+  This does not open the window. It uses ~/.config/oakkeep/config.json (archive path and folder pairs), catches the index up with files already on disk, then copies ticked folders only.
+
+  {cmd}
+
+  Example crontab line, every day at 07:00:
+
+  0 7 * * * {cmd} >> "$HOME/.local/share/oakkeep/sync.log" 2>&1
+
+  Exit 0 means the job finished. Exit 1 means the archive or a pair could not be used. Accounts with no saved folder selection are skipped, not copied in full.
+
+Special messages
+  Select one or more messages, then right-click and choose Mark as special or Unmark as special. A star shows on marked messages, and they stay at the top of the list. The mark is kept in the index, not inside the .eml file. Rebuild does not remove it. Trash and Delete do.
+
+Oakkeep {__version__}
+"""
 
 
 def choose_folder(parent, title: str, current: str = "") -> str | None:
@@ -75,6 +117,14 @@ class OakkeepWindow(Gtk.Window):
         self.settings_btn.connect("clicked", self.on_settings)
         bar.pack_start(self.settings_btn)
 
+        self.dup_btn = Gtk.Button(label="Duplicates")
+        self.dup_btn.connect("clicked", self.on_duplicates)
+        bar.pack_start(self.dup_btn)
+
+        self.help_btn = Gtk.Button(label="Help")
+        self.help_btn.connect("clicked", self.on_help)
+        bar.pack_end(self.help_btn)
+
         self.stop_btn = Gtk.Button(label="Stop")
         self.stop_btn.connect("clicked", self.on_stop)
         self.stop_btn.set_sensitive(False)
@@ -116,32 +166,56 @@ class OakkeepWindow(Gtk.Window):
 
         # display, filter value, count, mode (0=all, 1=account prefix, 2=exact folder)
         self.folder_store = Gtk.ListStore(str, str, int, int)
-        folder_view = Gtk.TreeView(model=self.folder_store)
-        folder_view.append_column(Gtk.TreeViewColumn("Folder", Gtk.CellRendererText(), text=0))
-        folder_view.append_column(Gtk.TreeViewColumn("#", Gtk.CellRendererText(), text=2))
-        folder_view.get_selection().connect("changed", self.on_folder)
+        self.folder_view = Gtk.TreeView(model=self.folder_store)
+        self.folder_view.append_column(Gtk.TreeViewColumn("Folder", Gtk.CellRendererText(), text=0))
+        self.folder_view.append_column(Gtk.TreeViewColumn("#", Gtk.CellRendererText(), text=2))
+        self.folder_view.get_selection().connect("changed", self.on_folder)
+        self.folder_view.connect("button-press-event", self.on_folder_click)
+        folder_view = self.folder_view
         scroll_f = Gtk.ScrolledWindow()
         scroll_f.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scroll_f.add(folder_view)
         scroll_f.set_size_request(240, -1)
         paned.add1(scroll_f)
 
-        # path, date, from, subject, clip, size_text, date_sort, has_attach, size_bytes
-        self.msg_store = Gtk.ListStore(str, str, str, str, str, str, str, int, int)
+        # path, date, from, subject, clip, size_text, date_sort, has_attach, size_bytes, special, star
+        self.msg_store = Gtk.ListStore(str, str, str, str, str, str, str, int, int, int, str)
 
-        def nocase(model, a, b, col):
-            sa = (model[a][col] or "").lower()
-            sb = (model[b][col] or "").lower()
-            return (sa > sb) - (sa < sb)
+        def pinned(model, a, b, col):
+            """Special messages stay above the rest. Column direction still applies within each group."""
+            sa = int(model[a][9] or 0)
+            sb = int(model[b][9] or 0)
+            if sa != sb:
+                displayed = sb - sa
+                direction = Gtk.SortType.ASCENDING
+                info = model.get_sort_column_id()
+                if isinstance(info, tuple):
+                    if len(info) == 3:
+                        direction = info[2]
+                    elif len(info) == 2:
+                        direction = info[1]
+                if direction == Gtk.SortType.DESCENDING:
+                    return -displayed
+                return displayed
+            va = model[a][col]
+            vb = model[b][col]
+            if isinstance(va, str) or isinstance(vb, str):
+                va = (va or "").lower()
+                vb = (vb or "").lower()
+            else:
+                va = int(va or 0)
+                vb = int(vb or 0)
+            return (va > vb) - (va < vb)
 
-        self.msg_store.set_sort_func(2, nocase, 2)
-        self.msg_store.set_sort_func(3, nocase, 3)
+        for sort_id in (2, 3, 6, 7, 8):
+            self.msg_store.set_sort_func(sort_id, pinned, sort_id)
         msg_view = Gtk.TreeView(model=self.msg_store)
         msg_view.set_headers_clickable(True)
         self.msg_cols: dict[str, Gtk.TreeViewColumn] = {}
         cfg0 = load_config()
         saved_w = cfg0.get("col_widths") or {}
         for cid, title, text_idx, width, sort_id in (
+            ("star", "★", 10, 46, 9),
             ("date", "Date", 1, 140, 6),
             ("from", "From", 2, 200, 2),
             ("subject", "Subject", 3, 360, 3),
@@ -150,7 +224,7 @@ class OakkeepWindow(Gtk.Window):
         ):
             renderer = Gtk.CellRendererText()
             renderer.set_property("xpad", 8)
-            if cid == "attach":
+            if cid in ("attach", "star"):
                 renderer.set_property("xalign", 0.5)
             if cid == "date":
                 renderer.set_property("xpad", 12)
@@ -162,7 +236,7 @@ class OakkeepWindow(Gtk.Window):
             col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
             col.set_min_width(36)
             col.set_fixed_width(int(saved_w.get(cid, width)))
-            col.set_alignment(0.5 if cid == "attach" else 0.0)
+            col.set_alignment(0.5 if cid in ("attach", "star") else 0.0)
             col.connect("notify::width", lambda *_: self._remember_layout())
             msg_view.append_column(col)
             self.msg_cols[cid] = col
@@ -259,7 +333,9 @@ class OakkeepWindow(Gtk.Window):
             self.hpaned.set_position(sh)
         if sv > 40:
             self.vpaned.set_position(sv)
-        order = cfg.get("col_order") or []
+        order = list(cfg.get("col_order") or [])
+        if order and "star" not in order:
+            order = ["star"] + order
         prev = None
         for cid in order:
             col = self.msg_cols.get(cid)
@@ -332,9 +408,48 @@ class OakkeepWindow(Gtk.Window):
             except Exception:
                 pass
 
+    def _show_incomplete_dialog(self, folders: list[str]) -> None:
+        dialog = Gtk.Dialog(
+            title="Incomplete Thunderbird folders",
+            transient_for=self,
+            flags=0,
+        )
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.set_default_size(560, 360)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        label = Gtk.Label(xalign=0)
+        label.set_line_wrap(True)
+        label.set_markup(
+            "These folders appear to have an incomplete local message store "
+            "(the .msf index is substantial but the mbox yielded few or no messages).\n\n"
+            "In Thunderbird, right-click each folder → Properties → Repair Folder.\n"
+            "Then click OK and run Copy from Thunderbird again. "
+            "Messages already copied will be skipped."
+        )
+        box.add(label)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_min_content_height(160)
+        textview = Gtk.TextView()
+        textview.set_editable(False)
+        textview.set_wrap_mode(Gtk.WrapMode.WORD)
+        textview.get_buffer().set_text("\n".join(folders))
+        scrolled.add(textview)
+        box.add(scrolled)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
     def _set_working(self, on: bool) -> None:
         self._working = on
-        for btn in (self.open_btn, self.copy_btn, self.settings_btn):
+        for btn in (self.open_btn, self.copy_btn, self.settings_btn, getattr(self, "dup_btn", None)):
+            if btn is None:
+                continue
             btn.set_sensitive(not on)
         for stop in (self.stop_btn, getattr(self, "stop_status_btn", None)):
             if stop is None:
@@ -436,6 +551,80 @@ class OakkeepWindow(Gtk.Window):
             save_config({key: path})
         return path
 
+    def on_help(self, *_a) -> None:
+        script = Path(__file__).resolve().parent.parent / "oakkeep-sync"
+        dialog = Gtk.Dialog(title="Oakkeep help", transient_for=self, flags=0)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(640, 520)
+        buf = Gtk.TextBuffer()
+        buf.set_text(help_text(script))
+        view = Gtk.TextView(buffer=buf)
+        view.set_editable(False)
+        view.set_wrap_mode(Gtk.WrapMode.WORD)
+        view.set_left_margin(12)
+        view.set_right_margin(12)
+        view.set_top_margin(12)
+        view.set_bottom_margin(12)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(view)
+        dialog.get_content_area().pack_start(scroll, True, True, 0)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def on_folder_click(self, view, event) -> bool:
+        if event.button != 3 or not self.archive:
+            return False
+        path_info = view.get_path_at_pos(int(event.x), int(event.y))
+        if not path_info:
+            return False
+        path, _col, _cx, _cy = path_info
+        model = view.get_model()
+        rel = model[path][1]
+        if not rel:
+            return True
+        view.get_selection().select_path(path)
+        if self.archive.folder_message_count(rel) != 0:
+            return True
+        menu = Gtk.Menu()
+        item = Gtk.MenuItem(label="Move empty folder to Trash")
+        item.connect("activate", lambda *_: self.trash_empty_folder(rel))
+        menu.append(item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def trash_empty_folder(self, rel: str) -> None:
+        if not self.archive:
+            return
+        if self.archive.folder_message_count(rel) != 0:
+            self._set_status("That folder is not empty. Only empty folders can be trashed.")
+            return
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text="Move this empty folder to Trash?",
+        )
+        dialog.format_secondary_text(
+            f"{rel}\n\nThe folder and any empty subfolders go to the desktop Trash. The index is updated."
+        )
+        ok = dialog.run() == Gtk.ResponseType.OK
+        dialog.destroy()
+        if not ok:
+            return
+        result = self.archive.trash_empty_folder(rel)
+        if result != "ok":
+            self._set_status("Could not move that folder to Trash.")
+            return
+        current = (self.current_folder or "").replace("\\", "/")
+        if current == rel or current.startswith(rel + "/"):
+            self.current_folder = None
+            self.current_prefix = False
+        self.refresh_folders()
+        self.refresh_list()
+        self._set_status(f"Moved empty folder to Trash: {rel}")
+
     def on_open(self, *_a) -> None:
         path = self._existing_path("archive") or self._ask_folder("EML archive folder", "archive")
         if path:
@@ -479,6 +668,7 @@ class OakkeepWindow(Gtk.Window):
         self._set_working(True)
         imported = skipped = 0
         missing = 0
+        incomplete: list[str] = []
         try:
             if not self.archive.integrity_ok():
                 self._set_status("Index is damaged. Use Settings → Rebuild index before copying.")
@@ -507,11 +697,13 @@ class OakkeepWindow(Gtk.Window):
                         t,
                     )
 
-                n, s = self.archive.copy_thunderbird(
+                n, s, bad = self.archive.copy_thunderbird(
                     tb, account, prog, folder_enabled=pair.get("folders") if isinstance(pair.get("folders"), dict) else None
                 )
                 imported += n
                 skipped += s
+                for rel in bad:
+                    incomplete.append(f"{account} / {rel}")
             self.refresh_folders()
             self.refresh_list()
             extra = f" · {missing} pair(s) skipped (folder missing)" if missing else ""
@@ -521,6 +713,8 @@ class OakkeepWindow(Gtk.Window):
             )
             self._set_status(msg)
             self._notify_done("Oakkeep", msg)
+            if incomplete:
+                self._show_incomplete_dialog(incomplete)
         finally:
             self._set_working(False)
 
@@ -552,7 +746,7 @@ class OakkeepWindow(Gtk.Window):
         box.add(Gtk.Label(label="Archive subfolder under Eml (pick an existing folder, or type a new name)", xalign=0))
         account_e = Gtk.Entry()
         account_e.set_text(current.get("account") or "")
-        account_e.set_placeholder_text("Work/imap.example.com")
+        account_e.set_placeholder_text("me@example.com")
         account_e.set_hexpand(True)
 
         def pick_archive(_b):
@@ -642,7 +836,9 @@ class OakkeepWindow(Gtk.Window):
             for folder in list_account_folders(Path(tb)):
                 listed_folders.append(folder)
                 cb = Gtk.CheckButton(label=folder["display"])
-                cb.set_active(saved_folders.get(folder["key"], True))
+                # New pair: start checked. Later folders stay off until ticked.
+                default_on = not isinstance(current.get("folders"), dict)
+                cb.set_active(saved_folders.get(folder["key"], default_on))
                 cb.set_margin_start(8 + int(folder["depth"]) * 16)
                 cb.connect("toggled", update_count)
                 checks_box.pack_start(cb, False, False, 0)
@@ -822,6 +1018,267 @@ class OakkeepWindow(Gtk.Window):
         if resp == REBUILD:
             GLib.idle_add(self.on_rebuild)
 
+    def on_duplicates(self, *_a) -> None:
+        if not self.archive:
+            self.on_open()
+            if not self.archive:
+                return
+        if self._working:
+            return
+        self._set_working(True)
+        self.archive.cancelled = False
+        try:
+            self._set_status("Pass 1: comparing headers…", 0, 0)
+
+            def prog(done, total, msg):
+                self._set_status(msg, done, total)
+
+            groups = self.archive.find_duplicate_groups(prog)
+        finally:
+            self._set_working(False)
+        extras = sum(max(len(g) - 1, 0) for g in groups)
+        if not groups:
+            self._set_status("No duplicates after content check.")
+            info = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="No duplicates found.",
+            )
+            info.format_secondary_text(
+                "Pass 1: same folder, sender, recipient, subject and message time.\n"
+                "Pass 2: same file content. Only groups that pass both are listed."
+            )
+            info.run()
+            info.destroy()
+            return
+        self._set_status(f"{extras} extra copies in {len(groups)} groups (content verified).")
+        self._duplicates_dialog(groups, extras)
+
+    def _duplicates_dialog(self, groups: list, extras: int) -> None:
+        dialog = Gtk.Dialog(title="Duplicates", transient_for=self, flags=0)
+        dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(960, 580)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        box.pack_start(
+            Gtk.Label(
+                label=(
+                    f"{extras} extra file(s) in {len(groups)} group(s) after content check. "
+                    "The first file in each group is kept unchecked."
+                ),
+                xalign=0,
+            ),
+            False,
+            False,
+            0,
+        )
+        # checked, path, folder, date, from, subject
+        store = Gtk.ListStore(bool, str, str, str, str, str)
+
+        def nocase(model, a, b, col):
+            sa = (model[a][col] or "").lower()
+            sb = (model[b][col] or "").lower()
+            return (sa > sb) - (sa < sb)
+
+        for col in (1, 2, 3, 4, 5):
+            store.set_sort_func(col, nocase, col)
+        view = Gtk.TreeView(model=store)
+        view.set_headers_clickable(True)
+        toggle = Gtk.CellRendererToggle()
+        toggle.connect("toggled", lambda cell, path: store[path].__setitem__(0, not store[path][0]))
+        col0 = Gtk.TreeViewColumn("", toggle, active=0)
+        col0.set_sort_column_id(0)
+        view.append_column(col0)
+        for title, idx, width in (
+            ("Folder", 2, 220),
+            ("Date", 3, 130),
+            ("From", 4, 180),
+            ("Subject", 5, 260),
+            ("File", 1, 220),
+        ):
+            r = Gtk.CellRendererText()
+            r.set_property("ellipsize", Pango.EllipsizeMode.END)
+            c = Gtk.TreeViewColumn(title, r, text=idx)
+            c.set_sort_column_id(idx)
+            c.set_clickable(True)
+            c.set_resizable(True)
+            c.set_min_width(80)
+            c.set_fixed_width(width)
+            view.append_column(c)
+        view.get_selection().set_mode(Gtk.SelectionMode.SINGLE)
+        for group in groups:
+            for i, row in enumerate(group):
+                when = local_when(row["date"] or "", row["date_sort"] or "")
+                store.append(
+                    [
+                        i > 0,
+                        row["path"],
+                        row["folder"] or "",
+                        when,
+                        row["from_name"] or row["from_addr"] or "",
+                        row["subject"] or "",
+                    ]
+                )
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.add(view)
+        box.pack_start(scroll, True, True, 0)
+
+        def selected_paths() -> list[str]:
+            return [r[1] for r in store if r[0]]
+
+        def clicked_path() -> str | None:
+            model, it = view.get_selection().get_selected()
+            if not it:
+                return None
+            return model[it][1]
+
+        def select_all(_b):
+            for r in store:
+                r[0] = True
+
+        def select_none(_b):
+            for r in store:
+                r[0] = False
+
+        def select_extras(_b):
+            seen: set[tuple] = set()
+            for r in store:
+                key = (r[2], r[3], r[4], r[5])
+                if key in seen:
+                    r[0] = True
+                else:
+                    seen.add(key)
+                    r[0] = False
+
+        def reveal_in_nautilus(rel: str | None) -> None:
+            if not rel or not self.archive:
+                return
+            path = self.archive.root / rel
+            if not path.exists():
+                self._set_status(f"File not found: {rel}")
+                return
+            try:
+                subprocess.Popen(["nautilus", "--select", str(path)])
+            except FileNotFoundError:
+                try:
+                    subprocess.Popen(["xdg-open", str(path.parent)])
+                except Exception as exc:
+                    self._set_status(str(exc))
+
+        def trash_rels(rels: list[str]) -> None:
+            if not rels or not self.archive:
+                return
+            n = self.archive.trash_paths(rels)
+            drop = set(rels)
+            for r in list(store):
+                if r[1] in drop:
+                    store.remove(r.iter)
+            self.refresh_folders()
+            self.refresh_list()
+            self._set_status(f"Moved {n} file(s) to Trash.")
+
+        def delete_rels(rels: list[str]) -> None:
+            if not rels or not self.archive:
+                return
+            ask = Gtk.MessageDialog(
+                transient_for=dialog,
+                flags=0,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.OK_CANCEL,
+                text=f"Permanently delete {len(rels)} file(s)?",
+            )
+            ok = ask.run() == Gtk.ResponseType.OK
+            ask.destroy()
+            if not ok:
+                return
+            n = self.archive.delete_paths(rels)
+            drop = set(rels)
+            for r in list(store):
+                if r[1] in drop:
+                    store.remove(r.iter)
+            self.refresh_folders()
+            self.refresh_list()
+            self._set_status(f"Deleted {n} file(s).")
+
+        def do_trash(_b):
+            trash_rels(selected_paths())
+
+        def do_delete(_b):
+            delete_rels(selected_paths())
+
+        def export_selected(_b):
+            rels = selected_paths()
+            if not rels:
+                return
+            chooser = Gtk.FileChooserNative.new(
+                "Export selected list", dialog, Gtk.FileChooserAction.SAVE, "Save", "Cancel"
+            )
+            chooser.set_current_name("oakkeep-duplicates.txt")
+            if chooser.run() != Gtk.ResponseType.ACCEPT:
+                chooser.destroy()
+                return
+            dest = chooser.get_filename()
+            chooser.destroy()
+            if not dest:
+                return
+            lines = []
+            for r in store:
+                if not r[0]:
+                    continue
+                lines.append(
+                    f"{r[3]}\t{r[2]}\t{r[4]}\t{r[5]}\t{r[1]}"
+                )
+            header = "# date\tfolder\tfrom\tsubject\tfile\n"
+            Path(dest).write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
+            self._set_status(f"Exported {len(rels)} line(s) to {dest}")
+
+        def on_right_click(widget, event) -> bool:
+            if event.button != 3:
+                return False
+            hit = view.get_path_at_pos(int(event.x), int(event.y))
+            if hit:
+                view.get_selection().select_path(hit[0])
+            rel = clicked_path()
+            menu = Gtk.Menu()
+
+            def add(label, fn):
+                item = Gtk.MenuItem(label=label)
+                item.connect("activate", fn)
+                menu.append(item)
+
+            add("Show in Nautilus", lambda *_: reveal_in_nautilus(rel))
+            add("Move this file to Trash", lambda *_: trash_rels([rel] if rel else []))
+            add("Delete this file", lambda *_: delete_rels([rel] if rel else []))
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+
+        view.connect("button-press-event", on_right_click)
+
+        btns = Gtk.Box(spacing=8)
+        for label, fn in (
+            ("Select all", select_all),
+            ("Select none", select_none),
+            ("Select extras only", select_extras),
+            ("Move to Trash", do_trash),
+            ("Delete", do_delete),
+            ("Export selected…", export_selected),
+        ):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", fn)
+            btns.pack_start(b, False, False, 0)
+        box.pack_start(btns, False, False, 0)
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
     def refresh_folders(self) -> None:
         self.folder_store.clear()
         if not self.archive:
@@ -832,7 +1289,7 @@ class OakkeepWindow(Gtk.Window):
             n = self.archive.count_prefix(rel)
             label = rel.split("/")[-1]
             indent = "    " * depth
-            self.folder_store.append([indent + label, rel, n, 1 if mode == 1 else 1])
+            self.folder_store.append([indent + label, rel, n, mode])
 
     def refresh_list(self) -> None:
         if not self.archive:
@@ -854,7 +1311,7 @@ class OakkeepWindow(Gtk.Window):
             self.msg_store.append(
                 [
                     r["path"],
-                    (r["date_sort"] or "")[:16].replace("T", " "),
+                    local_when(r["date"] or "", r["date_sort"] or ""),
                     r["from_name"] or r["from_addr"] or "",
                     r["subject"] or "",
                     clip,
@@ -862,6 +1319,8 @@ class OakkeepWindow(Gtk.Window):
                     r["date_sort"] or "",
                     int(r["has_attach"] or 0),
                     size_n,
+                    int(r["special"] or 0),
+                    "★" if int(r["special"] or 0) else "",
                 ]
             )
         if sort_col is not None and sort_col >= 0:
@@ -889,8 +1348,9 @@ class OakkeepWindow(Gtk.Window):
         model, it = selection.get_selected()
         if not it:
             return
-        self.current_folder = model[it][1] or None
-        mode = int(model[it][3]) if len(model[it]) > 3 else 2
+        row = model[it]
+        self.current_folder = row[1] or None
+        mode = int(row[3]) if row[3] is not None else 1
         self.current_prefix = mode in (0, 1) and bool(self.current_folder)
         if mode == 0:
             self.current_folder = None
@@ -920,10 +1380,11 @@ class OakkeepWindow(Gtk.Window):
             self.preview.get_buffer().set_text(str(exc))
             return
         msg = parse_message(data)
+        date = best_date(msg)
         head = [
             f"From: {msg.get('from') or ''}",
             f"To: {msg.get('to') or ''}",
-            f"Date: {msg.get('date') or ''}",
+            f"Date: {local_when(date)}" + (f"  ({date})" if date else ""),
             f"Subject: {msg.get('subject') or ''}",
             f"File: {rel}",
         ]
@@ -938,6 +1399,12 @@ class OakkeepWindow(Gtk.Window):
     def on_list_click(self, view, event) -> bool:
         if event.button != 3:
             return False
+        hit = view.get_path_at_pos(int(event.x), int(event.y))
+        selection = view.get_selection()
+        if hit and not selection.path_is_selected(hit[0]):
+            selection.unselect_all()
+            selection.select_path(hit[0])
+        rels = self.selected_paths()
         menu = Gtk.Menu()
         for label, fn in (
             ("Preview", self.preview_selected),
@@ -945,19 +1412,50 @@ class OakkeepWindow(Gtk.Window):
             ("Show in file manager", self.reveal_selected),
             ("Save as…", self.save_as),
             ("Select all", lambda *_: self.msg_view.get_selection().select_all()),
+            ("Mark as special", self.mark_selected),
+            ("Unmark as special", self.unmark_selected),
             ("Move to Trash", self.trash_selected),
             ("Delete", self.delete_selected),
         ):
             item = Gtk.MenuItem(label=label)
+            if label in ("Mark as special", "Unmark as special") and not rels:
+                item.set_sensitive(False)
             item.connect("activate", fn)
             menu.append(item)
         menu.show_all()
         menu.popup_at_pointer(event)
-        return False
+        return True
 
     def selected_paths(self) -> list[str]:
         model, rows = self.msg_view.get_selection().get_selected_rows()
         return [model[p][0] for p in rows]
+
+    def mark_selected(self, *_a) -> None:
+        self._set_selected_special(True)
+
+    def unmark_selected(self, *_a) -> None:
+        self._set_selected_special(False)
+
+    def _set_selected_special(self, marked: bool) -> None:
+        if not self.archive:
+            return
+        rels = self.selected_paths()
+        if not rels:
+            return
+        self.archive.set_special(rels, marked)
+        self.refresh_list()
+        self._reselect(rels)
+        if marked:
+            self._set_status(f"Marked {len(rels)} message(s) as special.")
+        else:
+            self._set_status(f"Unmarked {len(rels)} message(s).")
+
+    def _reselect(self, rels: list[str]) -> None:
+        want = set(rels)
+        sel = self.msg_view.get_selection()
+        for row in self.msg_store:
+            if row[0] in want:
+                sel.select_iter(row.iter)
 
     def preview_selected(self, *_a) -> None:
         if self.current_path:

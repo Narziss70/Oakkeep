@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -12,6 +13,7 @@ from .mail import (
     eml_filename,
     iter_mailbox,
     looks_like_mailbox,
+    mailbox_incomplete,
     mailbox_leaf,
     summarize,
     to_crlf,
@@ -101,9 +103,12 @@ class Archive:
               subject, sender, recipients, attach, body, path UNINDEXED
             );
             CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+            CREATE TABLE IF NOT EXISTS special (
+              path TEXT PRIMARY KEY
+            );
             """
         )
-        # Old databases had UNIQUE(archive_key), so a copy in an unpaired folder was
+        # Old databases had UNIQUE(archive_key), so a copy in postmaster@… was
         # dropped when the same Message-ID already lived under another account.
         # Path stays unique; the same mail may exist in more than one folder.
         try:
@@ -117,6 +122,57 @@ class Archive:
         except sqlite3.DatabaseError:
             pass
         self.conn.commit()
+        self._migrate_date_sort()
+        self._migrate_empty_dates()
+
+    def _migrate_date_sort(self) -> None:
+        """Rewrite date_sort to UTC from the stored Date header. Does not touch .eml files."""
+        row = self.conn.execute("SELECT v FROM meta WHERE k = 'date_sort_kind'").fetchone()
+        if row and row[0] == "utc":
+            return
+        from .mail import utc_sort
+
+        rows = self.conn.execute("SELECT path, date FROM messages").fetchall()
+        if rows:
+            self.conn.executemany(
+                "UPDATE messages SET date_sort = ? WHERE path = ?",
+                [(utc_sort(date), path) for path, date in rows],
+            )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO meta (k, v) VALUES ('date_sort_kind', 'utc')"
+        )
+        self.conn.commit()
+
+    def _migrate_empty_dates(self) -> None:
+        """Fill empty Date fields from Received: when the .eml has no Date: header.
+
+        Only touches index rows whose date is blank. Does not rewrite .eml files.
+        """
+        from .mail import best_date, iso_date, parse_message
+
+        rows = self.conn.execute(
+            "SELECT path FROM messages WHERE date IS NULL OR TRIM(date) = ''"
+        ).fetchall()
+        if not rows:
+            return
+        updates = []
+        for (rel,) in rows:
+            path = self.root / rel
+            if not path.is_file():
+                continue
+            try:
+                data = path.read_bytes()[: 512 * 1024]
+                date = best_date(parse_message(data))
+                if date:
+                    updates.append((date, iso_date(date), rel))
+            except Exception:
+                continue
+        if updates:
+            self.conn.executemany(
+                "UPDATE messages SET date = ?, date_sort = ? WHERE path = ?",
+                updates,
+            )
+            self.conn.commit()
 
     def integrity_ok(self) -> bool:
         try:
@@ -177,7 +233,7 @@ class Archive:
         return [(r["folder"] or "(root)", int(r["n"])) for r in rows]
 
     def account_prefixes(self) -> list[str]:
-        """Top-level archive folders (pairs and unpaired archive directories)."""
+        """Top-level archive folders (pairs and unpaired dirs such as postmaster@…)."""
         found: list[str] = []
         try:
             tops = sorted(
@@ -250,6 +306,75 @@ class Archive:
                 depth += 1
         return rows
 
+    def duplicate_key(self, row) -> tuple:
+        """Same sender, recipient, subject, message time, and archive subfolder."""
+        folder = (row["folder"] or "").strip().lower()
+        sender = (row["from_addr"] or "").strip().lower()
+        to_raw = (row["to_addr"] or "").strip().lower()
+        subject = (row["subject"] or "").strip().lower()
+        when = (row["date_sort"] or row["date"] or "").strip()
+        if when:
+            when = when.replace(" ", "T")[:16]  # YYYY-MM-DDTHH:MM
+        return (folder, sender, to_raw, subject, when)
+
+    def content_fingerprint(self, rel: str) -> str:
+        """Hash of the message payload (From_ line and newline style ignored)."""
+        path = self.root / rel
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        if data.startswith(b"From "):
+            nl = data.find(b"\n")
+            if nl >= 0:
+                data = data[nl + 1 :]
+        data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return hashlib.sha256(data).hexdigest()
+
+    def find_duplicate_groups(self, progress=None) -> list[list[sqlite3.Row]]:
+        """Two-pass: metadata on the index, then file content on candidates only."""
+        rows = list(
+            self.conn.execute(
+                """
+                SELECT path, folder, from_addr, from_name, to_addr, subject,
+                       date, date_sort, size
+                FROM messages
+                ORDER BY folder COLLATE NOCASE, date_sort, path
+                """
+            )
+        )
+        buckets: dict[tuple, list] = {}
+        for row in rows:
+            key = self.duplicate_key(row)
+            if not key[4]:
+                continue
+            buckets.setdefault(key, []).append(row)
+        candidates = [g for g in buckets.values() if len(g) > 1]
+        files = [row for g in candidates for row in g]
+        total = len(files)
+        if progress:
+            progress(0, total or 1, f"Pass 1: {len(candidates)} candidate group(s), {total} file(s)")
+        hashes: dict[str, str] = {}
+        for i, row in enumerate(files, 1):
+            if self.cancelled:
+                break
+            hashes[row["path"]] = self.content_fingerprint(row["path"])
+            if progress and (i % 5 == 0 or i == total):
+                progress(i, total or 1, f"Pass 2: checking content {i:,} / {total:,}")
+        verified: list[list] = []
+        for group in candidates:
+            by_fp: dict[str, list] = {}
+            for row in group:
+                fp = hashes.get(row["path"]) or ""
+                if not fp:
+                    continue
+                by_fp.setdefault(fp, []).append(row)
+            for sub in by_fp.values():
+                if len(sub) > 1:
+                    verified.append(sub)
+        verified.sort(key=lambda g: ((g[0]["folder"] or "").lower(), g[0]["path"]))
+        return verified
+
     def count_prefix(self, prefix: str | None) -> int:
         if not prefix:
             return self.count()
@@ -265,43 +390,61 @@ class Archive:
         folder_args: list = []
         if folder:
             if prefix:
-                folder_sql = " AND ({col} = ? OR {col} LIKE ?)"
+                folder_sql = " AND (m.folder = ? OR m.folder LIKE ?)"
                 folder_args = [folder, folder + "/%"]
             else:
-                folder_sql = " AND {col} = ?"
+                folder_sql = " AND m.folder = ?"
                 folder_args = [folder]
+
+        special_sql = "CASE WHEN s.path IS NOT NULL THEN 1 ELSE 0 END AS special"
+        order = " ORDER BY special DESC, m.date_sort DESC LIMIT ?"
 
         if q:
             try:
-                sql = """
-                  SELECT m.* FROM fts
+                sql = f"""
+                  SELECT m.*, {special_sql}
+                  FROM fts
                   JOIN messages m ON m.path = fts.path
+                  LEFT JOIN special s ON s.path = m.path
                   WHERE fts MATCH ?
                 """
-                sql += folder_sql.format(col="m.folder")
-                args: list = [q] + folder_args
-                sql += " ORDER BY m.date_sort DESC LIMIT ?"
-                args.append(limit)
+                sql += folder_sql
+                args: list = [q] + folder_args + [limit]
+                sql += order
                 return list(self.conn.execute(sql, args).fetchall())
             except sqlite3.OperationalError:
                 like = f"%{q.lower()}%"
-                sql = """
-                  SELECT * FROM messages
-                  WHERE (lower(subject) LIKE ? OR lower(from_name) LIKE ?
-                         OR lower(attach_names) LIKE ? OR lower(to_addr) LIKE ?)
+                sql = f"""
+                  SELECT m.*, {special_sql}
+                  FROM messages m
+                  LEFT JOIN special s ON s.path = m.path
+                  WHERE (lower(m.subject) LIKE ? OR lower(m.from_name) LIKE ?
+                         OR lower(m.attach_names) LIKE ? OR lower(m.to_addr) LIKE ?)
                 """
-                sql += folder_sql.format(col="folder")
-                args = [like, like, like, like] + folder_args
-                sql += " ORDER BY date_sort DESC LIMIT ?"
-                args.append(limit)
+                sql += folder_sql
+                args = [like, like, like, like] + folder_args + [limit]
+                sql += order
                 return list(self.conn.execute(sql, args).fetchall())
-        if folder:
-            sql = "SELECT * FROM messages WHERE 1=1" + folder_sql.format(col="folder")
-            sql += " ORDER BY date_sort DESC LIMIT ?"
-            return list(self.conn.execute(sql, folder_args + [limit]).fetchall())
-        return list(
-            self.conn.execute("SELECT * FROM messages ORDER BY date_sort DESC LIMIT ?", (limit,)).fetchall()
-        )
+        sql = f"""
+          SELECT m.*, {special_sql}
+          FROM messages m
+          LEFT JOIN special s ON s.path = m.path
+          WHERE 1=1
+        """
+        sql += folder_sql
+        sql += order
+        return list(self.conn.execute(sql, folder_args + [limit]).fetchall())
+
+    def set_special(self, rels: list[str], marked: bool) -> None:
+        """Remember or forget a special mark. Stored beside the index, not in the .eml file."""
+        paths = [(rel,) for rel in rels if rel]
+        if not paths:
+            return
+        if marked:
+            self.conn.executemany("INSERT OR IGNORE INTO special (path) VALUES (?)", paths)
+        else:
+            self.conn.executemany("DELETE FROM special WHERE path = ?", paths)
+        self.conn.commit()
 
     def keys(self) -> set[str]:
         return {r[0] for r in self.conn.execute("SELECT archive_key FROM messages")}
@@ -330,6 +473,7 @@ class Archive:
         for rel in rels:
             self.conn.execute("DELETE FROM fts WHERE path = ?", (rel,))
             self.conn.execute("DELETE FROM messages WHERE path = ?", (rel,))
+            self.conn.execute("DELETE FROM special WHERE path = ?", (rel,))
         self.conn.commit()
 
     def delete_paths(self, rels: list[str]) -> int:
@@ -382,6 +526,62 @@ class Archive:
         except Exception:
             return False
 
+    def folder_message_count(self, rel: str) -> int:
+        """Count .eml/.emlx files under an archive folder. Index is not trusted."""
+        rel = rel.replace("\\", "/").strip("/")
+        if not rel or ".." in Path(rel).parts:
+            return 1
+        path = (self.root / rel).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError:
+            return 1
+        if not path.is_dir():
+            return 1
+        n = 0
+        try:
+            for child in path.rglob("*"):
+                if child.is_file() and child.suffix.lower() in {".eml", ".emlx"}:
+                    n += 1
+        except OSError:
+            return 1
+        return n
+
+    def trash_empty_folder(self, rel: str) -> str:
+        """Move an empty archive folder to the desktop Trash and drop index rows.
+
+        Returns 'ok', 'not-empty', or 'failed'. Never touches the archive root.
+        """
+        rel = rel.replace("\\", "/").strip("/")
+        if not rel or ".." in Path(rel).parts:
+            return "failed"
+        path = (self.root / rel).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError:
+            return "failed"
+        if path == self.root or not path.is_dir():
+            return "failed"
+        if self.folder_message_count(rel):
+            return "not-empty"
+        if not self._trash_file(path):
+            return "failed"
+        prefix = rel + "/"
+        self.conn.execute(
+            "DELETE FROM messages WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+            (rel, prefix + "%"),
+        )
+        self.conn.execute(
+            "DELETE FROM fts WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+            (rel, prefix + "%"),
+        )
+        self.conn.execute(
+            "DELETE FROM special WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+            (rel, prefix + "%"),
+        )
+        self.conn.commit()
+        return "ok"
+
     def rebuild(self, progress=None) -> int:
         self.conn.execute("DELETE FROM messages")
         self.conn.execute("DELETE FROM fts")
@@ -416,6 +616,11 @@ class Archive:
             if i % 200 == 0:
                 self.conn.commit()
         self.conn.commit()
+        if not self.cancelled:
+            self.conn.execute(
+                "DELETE FROM special WHERE path NOT IN (SELECT path FROM messages)"
+            )
+            self.conn.commit()
         return total
 
     def index_file(self, rel: str, data: bytes, size: int) -> bool:
@@ -452,12 +657,13 @@ class Archive:
             ),
         )
 
-    def copy_thunderbird(self, tb: Path, account: str, progress=None, folder_enabled: dict | None = None) -> tuple[int, int]:
+    def copy_thunderbird(self, tb: Path, account: str, progress=None, folder_enabled: dict | None = None) -> tuple[int, int, list[str]]:
         dest = self.root / account if account else self.root
         dest.mkdir(parents=True, exist_ok=True)
         keys = self.keys()
         imported = 0
         skipped = 0
+        incomplete: list[str] = []
         self.cancelled = False
         mailboxes = filter_mailboxes(
             tb,
@@ -474,6 +680,12 @@ class Archive:
             leaf = mailbox_leaf(mailbox.name, existing)
             folder = dest / leaf
             folder.mkdir(parents=True, exist_ok=True)
+            if mailbox_incomplete(mailbox):
+                try:
+                    rel = mailbox.relative_to(tb).as_posix()
+                except ValueError:
+                    rel = mailbox.name
+                incomplete.append(rel)
             if progress:
                 progress(i, total, imported, skipped)
             for raw in iter_mailbox(mailbox):
@@ -510,4 +722,4 @@ class Archive:
             if progress:
                 progress(i, total, imported, skipped)
         self.conn.commit()
-        return imported, skipped
+        return imported, skipped, incomplete

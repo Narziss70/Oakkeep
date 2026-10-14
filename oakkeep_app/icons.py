@@ -25,6 +25,9 @@ def set_program_identity() -> None:
     except Exception:
         pass
     try:
+        import gi
+
+        gi.require_version("Gdk", "3.0")
         from gi.repository import Gdk
 
         Gdk.set_program_class(WM_CLASS)

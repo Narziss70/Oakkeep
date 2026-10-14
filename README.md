@@ -13,6 +13,8 @@ makes search fast; if the index breaks you rebuild it from the `.eml` files.
 
 Developed with assistance from [Grok](https://grok.x.ai/) (xAI).
 
+**Current version: 1.2.4**
+
 ## What it does
 
 - Browse and search an existing folder of `.eml` files (subject, from, to,
@@ -27,6 +29,11 @@ Developed with assistance from [Grok](https://grok.x.ai/) (xAI).
 - Desktop notification when index or copy finishes.
 - Open a message in the default app, show it in the file manager, move it
   to Trash, or delete it (the index is updated).
+- Mark messages as special. A star shows in the list and those messages
+  stay at the top. Marks live in the index and survive Rebuild.
+- Show message times in the computer's current timezone.
+- Warn at the end of Copy if a Thunderbird folder looks incomplete
+  (local mbox out of step with its `.msf` index).
 
 It does **not** send mail, change Thunderbird settings, or upload anything.
 
@@ -45,6 +52,18 @@ sudo apt install python3 python3-gi gir1.2-gtk-3.0 gir1.2-notify-0.7
 No pip packages are required.
 
 ## Install
+
+### From the .deb (recommended)
+
+Download `oakkeep_1.2.4_all.deb` from the [releases](https://github.com/Narziss70/Oakkeep/releases) page and install:
+
+```bash
+sudo dpkg -i oakkeep_1.2.4_all.deb
+```
+
+The package depends on `python3`, `python3-gi`, and `gir1.2-gtk-3.0`.
+
+### From source
 
 1. Clone or download this repository.
 2. Keep `oakkeep.py` next to the `oakkeep_app/` directory. Do not move the
